@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+from pathlib import Path
+from time import time as timer
+from typing import Optional
+from typing_extensions import Annotated
+
+import openai
+from typer import Typer, Argument, Option
+from dotenv import load_dotenv
+
+from actions import translate
+from consts import DEFAULT_LANGUAGE, languages
+from ui import info, warn, ok, end_color
+
+
+load_dotenv()
+
+openai.api_type = 'azure'
+openai.api_version = "2023-05-15"
+openai.api_base = os.getenv('AZURE_OPENAI_ENDPOINT')
+openai.api_key = os.getenv('AZURE_OPENAI_KEY')
+
+
+class State:
+    verbose: bool = False
+
+
+app = Typer()
+state = State()
+
+
+LOCALES_DIR = Path.cwd() / 'locales'
+OUTPUT_DIR = Path.cwd() / 'output'
+
+
+def validate(
+    source: Path,
+    language_from: str,
+    language_to: Optional[str],
+) -> Path:
+    if language_from not in languages:
+        print(f'{warn} Language {language_from} not found.')
+        sys.exit(1)
+
+    if language_to and language_to not in languages:
+        print(f'{warn} Language {language_to} not found.')
+        sys.exit(1)
+
+    if not source.is_file():
+        print(f'{warn} File {source} not found.')
+        sys.exit(1)
+
+    if not source.suffix == '.json':
+        print(f'{warn} File {source} is not a JSON file.')
+        sys.exit(1)
+
+    return source.resolve()
+
+
+def write_json(data: dict, path: Path) -> int:
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+    return path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+@app.command()
+def write(
+    source: Annotated[Path, Argument()],
+    output: Annotated[Optional[Path], Option('--output', '-o', help='Output file')] = None,
+    language_from: Annotated[str, Option('--from', '-f', help='Language to translate from')] = DEFAULT_LANGUAGE,
+    language_to: Annotated[Optional[str], Option('--to', '-t', help='Language to translate to')] = None,
+):
+    source = validate(source, language_from, language_to)
+    data = load_json(source)
+
+    if language_to:
+        result = translate(data, language_from, language_to, debug=state.verbose)
+
+        if output:
+            write_json(result, output)
+        else:
+            write_json(result, OUTPUT_DIR / f'{source.stem}.{language_to}.json')
+    else:
+        start = timer()
+        for locale in languages:
+            if locale == language_from:
+                continue
+
+            result = translate(data, language_from, language_to=locale, debug=state.verbose)
+            write_json(result, OUTPUT_DIR / f'{source.stem}.{locale}.json')
+
+            if state.verbose:
+                print(f'{ok} {warn}{languages[locale]}{end_color} ({locale}) done.\n')
+
+        end = timer()
+        if state.verbose:
+            print(f'{info} Total time: {warn}{end - start:.2f} sec{end_color}\n')
+
+
+@app.command()
+def update(
+    source: Annotated[Path, Argument()],
+    language_from: Annotated[str, Option('--from', '-f', help='Language to translate from')] = DEFAULT_LANGUAGE,
+    language_to: Annotated[str, Option('--to', '-t', help='Language to translate to')] = '',
+):
+    source = validate(source, language_from, language_to)
+    data = json.loads(source.read_text(), encoding='utf-8')
+
+    if language_to:
+        result = translate(data, language_from, language_to, debug=state.verbose)
+        target = LOCALES_DIR / language_to / source.name
+
+        translation = load_json(target)
+
+        # only one nested level allowed
+        for key, value in result.items():
+            if isinstance(value, dict) and key in translation:
+                translation[key] = {**translation[key], **value}
+            else:
+                translation[key] = value
+
+        write_json(translation, target)
+
+        if state.verbose:
+            print(f'{ok} {warn}{languages[language_to]}{end_color} ({language_to}) done.\n')
+    else:
+        start = timer()
+        for locale in LOCALES_DIR.iterdir():
+            if not locale.is_dir() or locale.name == language_from or len(locale.name) > 2:
+                continue
+
+            result = translate(data, language_from, language_to=locale.name, debug=state.verbose)
+            target = LOCALES_DIR / locale.name / source.name
+
+            translation = load_json(target)
+
+            # only one nested level allowed
+            for key, value in result.items():
+                if isinstance(value, dict) and key in translation:
+                    translation[key] = {**translation[key], **value}
+                else:
+                    translation[key] = value
+
+            write_json(translation, target)
+
+            if state.verbose:
+                print(f'{ok} {warn}{languages[locale.name]}{end_color} ({locale}) done.\n')
+
+        end = timer()
+        if state.verbose:
+            print(f'{info} Total time: {warn}{end - start:.2f} sec{end_color}\n')
+
+
+@app.callback()
+def main(
+    verbose: Annotated[bool, Option('-v', '--verbose', help="Show additional information")] = False,
+):
+    """
+    A CLI tool to translate JSON files using the OpenAI API.
+    """
+    if verbose:
+        state.verbose = True
+
+
+if __name__ == '__main__':
+    app()
